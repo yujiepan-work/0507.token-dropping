@@ -201,6 +201,18 @@ class ModelArguments:
         default=False,
         metadata={"help": "Will enable to load a pretrained model whose head dimensions are different."},
     )
+    use_smaller_router: bool = field(
+        default=False,
+        metadata={"help": "use a smaller (256 hidden size)"},
+    )
+    # num_preserved_tokens: int = field(
+    #     default=15,
+    #     metadata={"help": "topk"},
+    # )
+    token_pruning_strategy: str = field(
+        default="1:1",
+        metadata={"help": "token_pruning_strategy"},
+    )
 
 
 def main():
@@ -363,6 +375,11 @@ def main():
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
     )
+    config.use_smaller_router = model_args.use_smaller_router
+    # config.num_preserved_tokens = model_args.num_preserved_tokens
+    config.token_pruning_strategy = model_args.token_pruning_strategy
+    # config.training_args = training_args
+    logger.info(config.use_smaller_router)
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
         cache_dir=model_args.cache_dir,
@@ -511,6 +528,13 @@ def main():
     else:
         data_collator = None
 
+    for name, p in model.named_parameters():
+        if 'router_token' in name:
+            p.requires_grad_(True)
+            logger.warning(name)
+        else:
+            p.requires_grad_(False)
+
     # Initialize our Trainer
     trainer = Trainer(
         model=model,
@@ -613,6 +637,39 @@ def main():
         trainer.push_to_hub(**kwargs)
     else:
         trainer.create_model_card(**kwargs)
+    export_model(trainer)
+
+
+def export_model(trainer: Trainer):
+    import torch
+    import torch.onnx
+    from pathlib import Path
+    # Input to the model
+    device = None
+    for p in trainer.model.parameters():
+        device = p.device
+        break
+    input_ = {}
+    for data in trainer.get_eval_dataloader():
+        for k, v in data.items():
+            if 'label' not in k and 'position' not in k:
+                input_[k] = v[:1]
+                print(k, input_[k].shape)
+        break
+    trainer.model.eval()
+    torch_out = trainer.model(**input_)
+    # Export the model
+    torch.onnx.export(trainer.model,               # model being run
+                    tuple(input_.values()),                         # model input (or a tuple for multiple inputs)
+                    Path(trainer.args.output_dir, "model.onnx").as_posix(),   # where to save the model (can be a file or file-like object)
+                    export_params=True,        # store the trained parameter weights inside the model file
+                    opset_version=11,          # the ONNX version to export the model to
+                    do_constant_folding=True,  # whether to execute constant folding for optimization
+                    # input_names = ['input'],   # the model's input names
+                    # output_names = ['output'], # the model's output names
+                    # dynamic_axes={'input' : {0 : 'batch_size'},    # variable length axes
+                    #                 'output' : {0 : 'batch_size'}}
+    ) 
 
 
 def _mp_fn(index):

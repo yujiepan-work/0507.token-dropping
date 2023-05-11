@@ -51,6 +51,8 @@ from transformers.utils import (
 )
 from transformers.models.bert.configuration_bert import BertConfig
 
+from unittest.mock import MagicMock
+# print = MagicMock()
 
 logger = logging.get_logger(__name__)
 
@@ -351,6 +353,7 @@ class BertSelfAttention(nn.Module):
 
         # Normalize the attention scores to probabilities.
         attention_probs = nn.functional.softmax(attention_scores, dim=-1)
+        attention_probs_before_dropout = attention_probs
 
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
@@ -370,7 +373,7 @@ class BertSelfAttention(nn.Module):
 
         if self.is_decoder:
             outputs = outputs + (past_key_value,)
-        return outputs
+        return outputs, attention_probs_before_dropout
 
 
 class BertSelfOutput(nn.Module):
@@ -422,7 +425,7 @@ class BertAttention(nn.Module):
         past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         output_attentions: Optional[bool] = False,
     ) -> Tuple[torch.Tensor]:
-        self_outputs = self.self(
+        self_outputs, attention_scores = self.self(
             hidden_states,
             attention_mask,
             head_mask,
@@ -433,7 +436,7 @@ class BertAttention(nn.Module):
         )
         attention_output = self.output(self_outputs[0], hidden_states)
         outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
-        return outputs
+        return outputs, attention_scores
 
 
 class BertIntermediate(nn.Module):
@@ -466,7 +469,7 @@ class BertOutput(nn.Module):
 
 
 class BertLayer(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_id=None):
         super().__init__()
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
         self.seq_len_dim = 1
@@ -479,6 +482,13 @@ class BertLayer(nn.Module):
             self.crossattention = BertAttention(config, position_embedding_type="absolute")
         self.intermediate = BertIntermediate(config)
         self.output = BertOutput(config)
+        self.layer_id = layer_id
+        self.token_pruning_strategy = eval('{' + config.token_pruning_strategy.replace('_', ',').replace('-', ':') + '}')
+        self.num_preserved_tokens = self.token_pruning_strategy.get(self.layer_id, -1)
+        logger.warning('Block %d - preserve %d tokens + new token + class token', layer_id, self.num_preserved_tokens)
+        if self.num_preserved_tokens > 0:
+            from .routing import Router
+            self.router_token = Router(config, self.num_preserved_tokens)
 
     def forward(
         self,
@@ -489,10 +499,10 @@ class BertLayer(nn.Module):
         encoder_attention_mask: Optional[torch.FloatTensor] = None,
         past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         output_attentions: Optional[bool] = False,
-    ) -> Tuple[torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
         self_attn_past_key_value = past_key_value[:2] if past_key_value is not None else None
-        self_attention_outputs = self.attention(
+        self_attention_outputs, self_attention_scores = self.attention(
             hidden_states,
             attention_mask,
             head_mask,
@@ -543,7 +553,11 @@ class BertLayer(nn.Module):
         if self.is_decoder:
             outputs = outputs + (present_key_value,)
 
-        return outputs
+        if self.num_preserved_tokens > 0:
+            new_output, new_attention_mask = self.router_token(layer_output, attention_mask, self_attention_scores)
+            return (new_output, *outputs[1:]), new_attention_mask
+
+        return outputs, attention_mask
 
     def feed_forward_chunk(self, attention_output):
         intermediate_output = self.intermediate(attention_output)
@@ -555,7 +569,7 @@ class BertEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.layer = nn.ModuleList([BertLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layer = nn.ModuleList([BertLayer(config, i) for i in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
 
     def forward(
@@ -583,6 +597,7 @@ class BertEncoder(nn.Module):
                 use_cache = False
 
         next_decoder_cache = () if use_cache else None
+        new_attention_mask = attention_mask
         for i, layer_module in enumerate(self.layer):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
@@ -607,9 +622,9 @@ class BertEncoder(nn.Module):
                     encoder_attention_mask,
                 )
             else:
-                layer_outputs = layer_module(
+                layer_outputs, new_attention_mask = layer_module(
                     hidden_states,
-                    attention_mask,
+                    new_attention_mask,
                     layer_head_mask,
                     encoder_hidden_states,
                     encoder_attention_mask,
@@ -990,6 +1005,7 @@ class BertModel(BertPreTrainedModel):
 
         # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
         # ourselves in which case we just need to make it broadcastable to all heads.
+        # print(attention_mask.sum(dim=1).min()) # minimal seq len
         extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(attention_mask, input_shape)
 
         # If a 2D or 3D attention mask is provided for the cross-attention
